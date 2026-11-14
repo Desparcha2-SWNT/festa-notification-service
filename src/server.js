@@ -8,7 +8,12 @@ import { startReminderJob } from './jobs/reminders.js';
 async function ensureIndexes(db) {
   await db.collection('users').createIndex({ location: '2dsphere' });
   await db.collection('users').createIndex({ role: 1 });
-  await db.collection('users').createIndex({ 'devices.token': 1 });
+  // Único: un token FCM pertenece a una sola cuenta. Parcial para no chocar con usuarios sin dispositivos.
+  // Si ya hay tokens duplicados en una base existente, este índice fallará: depurarlos antes de desplegar.
+  await db.collection('users').createIndex(
+    { 'devices.token': 1 },
+    { unique: true, partialFilterExpression: { 'devices.token': { $exists: true } } },
+  );
   await db.collection('notifications').createIndex({ userId: 1, createdAt: -1 });
   await db.collection('reminders').createIndex({ sentAt: 1, cancelled: 1, sendAt: 1 });
   await db.collection('reminders').createIndex({ eventId: 1 });

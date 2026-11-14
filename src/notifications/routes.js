@@ -33,12 +33,24 @@ notificationsRouter.post('/devices', async (req, res, next) => {
   try {
     const users = getDb().collection('users');
     const { token, platform } = parsed.data;
-    await users.updateMany({ _id: { $ne: req.auth.userId } }, { $pull: { devices: { token } } });
-    await users.updateOne({ _id: req.auth.userId }, { $pull: { devices: { token } } }, { upsert: true });
-    await users.updateOne(
-      { _id: req.auth.userId },
-      { $push: { devices: { $each: [{ token, platform, registeredAt: new Date() }], $slice: -5 } } },
-    );
+    // Un token tiene un solo dueño: el índice único de devices.token (server.js) impide que dos cuentas
+    // lo tengan a la vez. Si dos registros chocan, el que pierde (E11000) repite la secuencia completa.
+    const writeOwner = async () => {
+      await users.updateMany({ _id: { $ne: req.auth.userId } }, { $pull: { devices: { token } } });
+      await users.updateOne({ _id: req.auth.userId }, { $pull: { devices: { token } } }, { upsert: true });
+      await users.updateOne(
+        { _id: req.auth.userId },
+        { $push: { devices: { $each: [{ token, platform, registeredAt: new Date() }], $slice: -5 } } },
+      );
+    };
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await writeOwner();
+        break;
+      } catch (err) {
+        if (err?.code !== 11000 || attempt >= 3) throw err;
+      }
+    }
     res.status(204).end();
   } catch (err) {
     next(err);
