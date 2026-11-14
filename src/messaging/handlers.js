@@ -119,8 +119,9 @@ export const handlers = {
           locationConsent: true,
           suspended: { $ne: true },
           locationUpdatedAt: { $gte: since },
-          $or: [{ interests: d.category }, { interests: { $exists: false } }, { interests: { $size: 0 } }],
-          // $geoWithin (y no $near) porque se combina con $or; el radio va en radianes.
+          // Solo usuarios con esa categoría entre sus intereses: sin intereses no hay afinidad, no se avisa.
+          interests: d.category,
+          // $geoWithin (y no $near) por el criterio de geometría; el radio va en radianes.
           location: {
             $geoWithin: {
               $centerSphere: [[d.venue.location.lng, d.venue.location.lat], config.nearbyRadiusMeters / EARTH_RADIUS_M],
