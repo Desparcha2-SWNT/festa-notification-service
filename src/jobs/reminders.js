@@ -2,27 +2,44 @@ import { getDb } from '../db/mongo.js';
 import { logger } from '../logger.js';
 import { formatDate, notifyUsers } from '../notifications/notifier.js';
 
+// Tiempo que una réplica conserva el recordatorio mientras lo envía. Si muere, otra lo retoma al vencer.
+const LEASE_MS = 5 * 60_000;
+
 /**
  * RF12: recordatorios de asistencia. Cada minuto toma los recordatorios vencidos y los envía.
- * Cada uno se "reclama" con findOneAndUpdate (sentAt) antes de enviar, así dos réplicas no lo
- * mandan dos veces; la notificación además es idempotente por su dedupeKey.
+ * Con lease (claimedUntil): una réplica lo reserva mientras lo envía y solo marca sentAt tras
+ * confirmar la notificación. Si falla, se libera para reintentar; si muere, el lease vence y otra
+ * réplica lo retoma. La notificación es idempotente por su dedupeKey, así un reenvío no duplica.
  */
 export async function sendDueReminders(db = getDb(), now = new Date()) {
   const reminders = db.collection('reminders');
   let sent = 0;
   for (;;) {
     const r = await reminders.findOneAndUpdate(
-      { sentAt: null, cancelled: false, sendAt: { $lte: now }, startsAt: { $gt: now } },
-      { $set: { sentAt: now } },
+      {
+        sentAt: null,
+        cancelled: false,
+        sendAt: { $lte: now },
+        startsAt: { $gt: now },
+        $or: [{ claimedUntil: null }, { claimedUntil: { $lte: now } }],
+      },
+      { $set: { claimedUntil: new Date(now.getTime() + LEASE_MS) } },
       { sort: { sendAt: 1 }, returnDocument: 'after' },
     );
     if (!r) break;
-    await notifyUsers(
-      [r.userId],
-      { kind: 'reminder', title: `Hoy: ${r.title}`, body: `Empieza a las ${formatDate(r.startsAt)}. No olvides tu QR.`, eventId: r.eventId },
-      { dedupeKey: `reminder:${r._id}:${r.startsAt.toISOString()}` },
-      db,
-    );
+    try {
+      await notifyUsers(
+        [r.userId],
+        { kind: 'reminder', title: `Hoy: ${r.title}`, body: `Empieza a las ${formatDate(r.startsAt)}. No olvides tu QR.`, eventId: r.eventId },
+        { dedupeKey: `reminder:${r._id}:${r.startsAt.toISOString()}` },
+        db,
+      );
+    } catch (err) {
+      // Se libera el lease para que el siguiente intento lo tome; el error corta esta tanda.
+      await reminders.updateOne({ _id: r._id }, { $set: { claimedUntil: null } }).catch(() => {});
+      throw err;
+    }
+    await reminders.updateOne({ _id: r._id }, { $set: { sentAt: new Date() }, $unset: { claimedUntil: '' } });
     sent++;
   }
   // Los recordatorios de eventos que ya empezaron sin enviarse se descartan.
