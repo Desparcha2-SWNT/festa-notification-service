@@ -50,9 +50,25 @@ describe('sendDueReminders (lease)', () => {
   it('si la notificación falla, libera el lease y no marca sentAt', async () => {
     n.notifyUsers.mockRejectedValue(new Error('fcm caído'));
     const { db, updates } = fakeDb([reminder]);
-    await expect(sendDueReminders(db, now)).rejects.toThrow('fcm caído');
+    const sent = await sendDueReminders(db, now);
+    expect(sent).toBe(0);
     expect(updates.some((u) => u.update.$set?.sentAt)).toBe(false);
     expect(updates.some((u) => u.update.$set?.claimedUntil === null)).toBe(true);
+  });
+
+  it('si FCM no confirma el push (failedCount), no se marca enviado aunque notifyUsers no lance', async () => {
+    n.notifyUsers.mockResolvedValue({ recipients: 1, failedCount: 1 });
+    const { db, updates } = fakeDb([reminder]);
+    const sent = await sendDueReminders(db, now);
+    expect(sent).toBe(0);
+    expect(updates.some((u) => u.update.$set?.sentAt)).toBe(false);
+  });
+
+  it('un recordatorio que falla no bloquea a los siguientes', async () => {
+    n.notifyUsers.mockRejectedValueOnce(new Error('fcm caído')).mockResolvedValue({ recipients: 1, failedCount: 0 });
+    const { db } = fakeDb([reminder, { ...reminder, _id: 'r2' }]);
+    const sent = await sendDueReminders(db, now);
+    expect(sent).toBe(1);
   });
 
   it('reclama con lease vencible en vez de marcar sentAt antes de enviar', async () => {

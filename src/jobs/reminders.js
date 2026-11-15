@@ -14,6 +14,7 @@ const LEASE_MS = 5 * 60_000;
 export async function sendDueReminders(db = getDb(), now = new Date()) {
   const reminders = db.collection('reminders');
   let sent = 0;
+  const skipped = []; // recordatorios que fallaron en esta tanda: se dejan para el siguiente minuto
   for (;;) {
     const r = await reminders.findOneAndUpdate(
       {
@@ -21,6 +22,7 @@ export async function sendDueReminders(db = getDb(), now = new Date()) {
         cancelled: false,
         sendAt: { $lte: now },
         startsAt: { $gt: now },
+        _id: { $nin: skipped },
         $or: [{ claimedUntil: null }, { claimedUntil: { $lte: now } }],
       },
       { $set: { claimedUntil: new Date(now.getTime() + LEASE_MS) } },
@@ -28,16 +30,20 @@ export async function sendDueReminders(db = getDb(), now = new Date()) {
     );
     if (!r) break;
     try {
-      await notifyUsers(
+      const result = await notifyUsers(
         [r.userId],
         { kind: 'reminder', title: `Hoy: ${r.title}`, body: `Empieza a las ${formatDate(r.startsAt)}. No olvides tu QR.`, eventId: r.eventId },
         { dedupeKey: `reminder:${r._id}:${r.startsAt.toISOString()}` },
         db,
       );
+      // notifyUsers absorbe los errores de FCM y los cuenta: un push fallido no cuenta como enviado.
+      if (result?.failedCount > 0) throw new Error(`push del recordatorio ${r._id} no confirmado por FCM`);
     } catch (err) {
-      // Se libera el lease para que el siguiente intento lo tome; el error corta esta tanda.
+      // Se libera el lease para que el siguiente minuto lo tome; no se marca enviado.
+      logger.error({ err, reminderId: String(r._id) }, 'recordatorio no enviado, se reintenta');
+      skipped.push(r._id);
       await reminders.updateOne({ _id: r._id }, { $set: { claimedUntil: null } }).catch(() => {});
-      throw err;
+      continue;
     }
     await reminders.updateOne({ _id: r._id }, { $set: { sentAt: new Date() }, $unset: { claimedUntil: '' } });
     sent++;
