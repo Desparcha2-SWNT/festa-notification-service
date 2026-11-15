@@ -27,6 +27,8 @@ export async function notifyUsers(userIds, message, { dedupeKey, causationId = n
   );
 
   const fresh = [];
+  const pushUsers = []; // usuarios a los que hay que enviar push en este intento
+  const pushIds = []; // ids de bandeja de esos usuarios (para marcar pushedAt)
   for (const userId of unique) {
     if (blocked.has(userId)) continue;
     const id = deterministicUuid(`${dedupeKey}:${userId}`);
@@ -46,27 +48,42 @@ export async function notifyUsers(userIds, message, { dedupeKey, causationId = n
       },
       { upsert: true },
     );
-    if (res.upsertedCount === 1) fresh.push(userId);
+    if (res.upsertedCount === 1) {
+      fresh.push(userId);
+      pushUsers.push(userId);
+      pushIds.push(id);
+    } else {
+      // Ya estaba en la bandeja (intento anterior). El push falta si nunca se confirmó (pushedAt vacío):
+      // así un fallo entre guardar y enviar no deja al usuario sin el aviso.
+      const prev = await inbox.findOne({ _id: id }, { projection: { pushedAt: 1 } });
+      if (prev && !prev.pushedAt) {
+        pushUsers.push(userId);
+        pushIds.push(id);
+      }
+    }
   }
 
   let failedCount = 0;
-  if (fresh.length > 0) {
-    const docs = await users.find({ _id: { $in: fresh } }, { projection: { devices: 1 } }).toArray();
+  if (pushUsers.length > 0) {
+    const docs = await users.find({ _id: { $in: pushUsers } }, { projection: { devices: 1 } }).toArray();
     const tokens = docs.flatMap((u) => (u.devices ?? []).map((d) => d.token));
     try {
-      const result = await sendPush(tokens, {
-        title: message.title,
-        body: message.body,
-        data: { kind: message.kind, eventId: message.eventId, ...(message.data ?? {}) },
-      });
-      failedCount = result.failed;
-      if (result.invalidTokens.length > 0) {
-        await users.updateMany({}, { $pull: { devices: { token: { $in: result.invalidTokens } } } });
+      if (tokens.length > 0) {
+        const result = await sendPush(tokens, {
+          title: message.title,
+          body: message.body,
+          data: { kind: message.kind, eventId: message.eventId, ...(message.data ?? {}) },
+        });
+        failedCount = result.failed;
+        if (result.invalidTokens.length > 0) {
+          await users.updateMany({}, { $pull: { devices: { token: { $in: result.invalidTokens } } } });
+        }
       }
+      // Solo se marca como enviado si FCM aceptó todo; si no, el reintento lo vuelve a intentar.
+      if (failedCount === 0) await inbox.updateMany({ _id: { $in: pushIds } }, { $set: { pushedAt: new Date() } });
     } catch (err) {
-      // El push es "mejor esfuerzo": la notificación ya quedó en la bandeja.
       logger.error({ err, kind: message.kind }, 'falló el envío a FCM');
-      failedCount = tokens.length;
+      failedCount = Math.max(tokens.length, 1);
     }
   }
 
