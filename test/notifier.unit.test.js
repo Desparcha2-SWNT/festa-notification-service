@@ -70,5 +70,22 @@ describe('notifyUsers: push pendiente', () => {
     const res = await notifyUsers(['u1'], message, { dedupeKey: 'k1' }, db);
     expect(res.failedCount).toBe(1);
     expect(db.inbox.docs['id-k1:u1'].pushedAt).toBeUndefined();
+    expect(res.retryableFailed).toBe(1);
+  });
+
+  it('un token inválido (permanente) se descarta y no deja el push pendiente para siempre', async () => {
+    m.sendPush.mockResolvedValue({ failed: 1, invalidTokens: ['tok-1'] });
+    const db = fakeDb();
+    const res = await notifyUsers(['u1'], message, { dedupeKey: 'k1' }, db);
+    expect(res).toMatchObject({ failedCount: 1, retryableFailed: 0 });
+    expect(db.inbox.docs['id-k1:u1'].pushedAt).toBeInstanceOf(Date);
+  });
+
+  it('si FCM lanza, todo cuenta como reintentable', async () => {
+    m.sendPush.mockRejectedValue(new Error('FCM caído'));
+    const db = fakeDb();
+    const res = await notifyUsers(['u1'], message, { dedupeKey: 'k1' }, db);
+    expect(res.retryableFailed).toBe(1);
+    expect(db.inbox.docs['id-k1:u1'].pushedAt).toBeUndefined();
   });
 });

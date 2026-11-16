@@ -64,6 +64,13 @@ describe('sendDueReminders (lease)', () => {
     expect(updates.some((u) => u.update.$set?.sentAt)).toBe(false);
   });
 
+  it('si el único fallo fue un token inválido (permanente), el recordatorio sí se marca enviado', async () => {
+    n.notifyUsers.mockResolvedValue({ recipients: 1, failedCount: 1, retryableFailed: 0 });
+    const { db, updates } = fakeDb([reminder]);
+    expect(await sendDueReminders(db, now)).toBe(1);
+    expect(updates.some((u) => u.update.$set?.sentAt)).toBe(true);
+  });
+
   it('un recordatorio que falla no bloquea a los siguientes', async () => {
     n.notifyUsers.mockRejectedValueOnce(new Error('fcm caído')).mockResolvedValue({ recipients: 1, failedCount: 0 });
     const { db } = fakeDb([reminder, { ...reminder, _id: 'r2' }]);

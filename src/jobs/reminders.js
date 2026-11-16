@@ -36,8 +36,9 @@ export async function sendDueReminders(db = getDb(), now = new Date()) {
         { dedupeKey: `reminder:${r._id}:${r.startsAt.toISOString()}` },
         db,
       );
-      // notifyUsers absorbe los errores de FCM y los cuenta: un push fallido no cuenta como enviado.
-      if (result?.failedCount > 0) throw new Error(`push del recordatorio ${r._id} no confirmado por FCM`);
+      // notifyUsers absorbe los errores de FCM y los cuenta: un push con fallos reintentables no cuenta
+      // como enviado. Los tokens inválidos (permanentes) se descartan y no bloquean el recordatorio.
+      if ((result?.retryableFailed ?? result?.failedCount) > 0) throw new Error(`push del recordatorio ${r._id} no confirmado por FCM`);
     } catch (err) {
       // Se libera el lease para que el siguiente minuto lo tome; no se marca enviado.
       logger.error({ err, reminderId: String(r._id) }, 'recordatorio no enviado, se reintenta');

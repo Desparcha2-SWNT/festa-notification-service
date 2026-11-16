@@ -64,6 +64,9 @@ export async function notifyUsers(userIds, message, { dedupeKey, causationId = n
   }
 
   let failedCount = 0;
+  // Fallos que vale la pena reintentar. Un token inválido o dado de baja es permanente: se borra del
+  // usuario y no debe dejar el push pendiente para siempre (ni bloquear el recordatorio).
+  let retryableFailed = 0;
   if (pushUsers.length > 0) {
     const docs = await users.find({ _id: { $in: pushUsers } }, { projection: { devices: 1 } }).toArray();
     const tokens = docs.flatMap((u) => (u.devices ?? []).map((d) => d.token));
@@ -75,15 +78,17 @@ export async function notifyUsers(userIds, message, { dedupeKey, causationId = n
           data: { kind: message.kind, eventId: message.eventId, ...(message.data ?? {}) },
         });
         failedCount = result.failed;
+        retryableFailed = Math.max(result.failed - result.invalidTokens.length, 0);
         if (result.invalidTokens.length > 0) {
           await users.updateMany({}, { $pull: { devices: { token: { $in: result.invalidTokens } } } });
         }
       }
-      // Solo se marca como enviado si FCM aceptó todo; si no, el reintento lo vuelve a intentar.
-      if (failedCount === 0) await inbox.updateMany({ _id: { $in: pushIds } }, { $set: { pushedAt: new Date() } });
+      // Solo se marca como enviado si no quedan fallos reintentables; si no, el reintento lo vuelve a intentar.
+      if (retryableFailed === 0) await inbox.updateMany({ _id: { $in: pushIds } }, { $set: { pushedAt: new Date() } });
     } catch (err) {
       logger.error({ err, kind: message.kind }, 'falló el envío a FCM');
       failedCount = Math.max(tokens.length, 1);
+      retryableFailed = failedCount;
     }
   }
 
@@ -106,7 +111,7 @@ export async function notifyUsers(userIds, message, { dedupeKey, causationId = n
       db,
     );
   }
-  return { recipients: fresh.length, failedCount };
+  return { recipients: fresh.length, failedCount, retryableFailed };
 }
 
 /** Ids de los administradores (para avisos de comercios por verificar y reportes). */
