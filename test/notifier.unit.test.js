@@ -14,7 +14,7 @@ const { notifyUsers } = await import('../src/notifications/notifier.js');
 const message = { kind: 'ticket', title: 'Tu boleta', body: 'Lista' };
 
 // bandeja: `existing` simula filas que ya estaban (de un intento anterior).
-function fakeDb(existing = {}) {
+function fakeDb(existing = {}, devices = [{ token: 'tok-1' }]) {
   const inbox = {
     docs: { ...existing },
     updateOne: vi.fn(async (filter, update) => {
@@ -23,23 +23,45 @@ function fakeDb(existing = {}) {
       return { upsertedCount: 1 };
     }),
     findOne: vi.fn(async (filter) => inbox.docs[filter._id] ?? null),
+    find: vi.fn((filter) => ({
+      toArray: async () => filter._id.$in.map((id) => inbox.docs[id]).filter(Boolean),
+    })),
     updateMany: vi.fn(async (filter, update) => {
-      for (const id of filter._id.$in) if (inbox.docs[id]) Object.assign(inbox.docs[id], update.$set);
+      for (const id of filter._id.$in) {
+        const doc = inbox.docs[id];
+        if (!doc) continue;
+        if (update.$set) Object.assign(doc, update.$set);
+        if (update.$addToSet) {
+          const [field, { $each }] = Object.entries(update.$addToSet)[0];
+          doc[field] = [...new Set([...(doc[field] ?? []), ...$each])];
+        }
+      }
       return {};
     }),
   };
   const users = {
     find: vi.fn((filter) => ({
-      toArray: async () => (filter.suspended ? [] : [{ _id: 'u1', devices: [{ token: 'tok-1' }] }]),
+      toArray: async () => (filter.suspended ? [] : [{ _id: 'u1', devices }]),
     })),
     updateMany: vi.fn(async () => ({})),
   };
-  return { collection: (name) => (name === 'users' ? users : inbox), inbox };
+  return { collection: (name) => (name === 'users' ? users : inbox), inbox, users };
 }
+
+// Resultado de sendPush en la forma real de fcm.js.
+const ok = (okTokens = [], extra = {}) => ({
+  sent: okTokens.length,
+  failed: 0,
+  invalidTokens: [],
+  permanentTokens: [],
+  okTokens,
+  retryableTokens: [],
+  ...extra,
+});
 
 describe('notifyUsers: push pendiente', () => {
   beforeEach(() => {
-    m.sendPush.mockReset().mockResolvedValue({ failed: 0, invalidTokens: [] });
+    m.sendPush.mockReset().mockResolvedValue(ok(['tok-1']));
     m.enqueue.mockReset();
   });
 
@@ -64,8 +86,8 @@ describe('notifyUsers: push pendiente', () => {
     expect(m.sendPush).not.toHaveBeenCalled();
   });
 
-  it('si FCM reporta fallos, no marca pushedAt y devuelve failedCount', async () => {
-    m.sendPush.mockResolvedValue({ failed: 1, invalidTokens: [] });
+  it('si FCM reporta fallos reintentables, no marca pushedAt y devuelve failedCount', async () => {
+    m.sendPush.mockResolvedValue(ok([], { failed: 1, retryableTokens: ['tok-1'] }));
     const db = fakeDb();
     const res = await notifyUsers(['u1'], message, { dedupeKey: 'k1' }, db);
     expect(res.failedCount).toBe(1);
@@ -74,10 +96,35 @@ describe('notifyUsers: push pendiente', () => {
   });
 
   it('un token inválido (permanente) se descarta y no deja el push pendiente para siempre', async () => {
-    m.sendPush.mockResolvedValue({ failed: 1, invalidTokens: ['tok-1'] });
+    m.sendPush.mockResolvedValue(ok([], { failed: 1, invalidTokens: ['tok-1'] }));
     const db = fakeDb();
     const res = await notifyUsers(['u1'], message, { dedupeKey: 'k1' }, db);
     expect(res).toMatchObject({ failedCount: 1, retryableFailed: 0 });
+    expect(db.inbox.docs['id-k1:u1'].pushedAt).toBeInstanceOf(Date);
+    expect(db.users.updateMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('invalid-argument (error del payload) no borra el dispositivo ni deja el push pendiente', async () => {
+    m.sendPush.mockResolvedValue(ok([], { failed: 1, permanentTokens: ['tok-1'] }));
+    const db = fakeDb();
+    const res = await notifyUsers(['u1'], message, { dedupeKey: 'k1' }, db);
+    expect(res).toMatchObject({ failedCount: 1, retryableFailed: 0 });
+    expect(db.inbox.docs['id-k1:u1'].pushedAt).toBeInstanceOf(Date);
+    expect(db.users.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('en un reintento solo se envía a los tokens que aún no recibieron el push', async () => {
+    const db = fakeDb({}, [{ token: 'tok-1' }, { token: 'tok-2' }]);
+    m.sendPush.mockResolvedValueOnce(ok(['tok-1'], { failed: 1, retryableTokens: ['tok-2'] }));
+    const first = await notifyUsers(['u1'], message, { dedupeKey: 'k1' }, db);
+    expect(first.retryableFailed).toBe(1);
+    expect(db.inbox.docs['id-k1:u1'].pushedAt).toBeUndefined();
+    expect(db.inbox.docs['id-k1:u1'].pushedTokens).toEqual(['tok-1']);
+
+    m.sendPush.mockResolvedValueOnce(ok(['tok-2']));
+    const second = await notifyUsers(['u1'], message, { dedupeKey: 'k1' }, db);
+    expect(m.sendPush).toHaveBeenLastCalledWith(['tok-2'], expect.anything());
+    expect(second.retryableFailed).toBe(0);
     expect(db.inbox.docs['id-k1:u1'].pushedAt).toBeInstanceOf(Date);
   });
 

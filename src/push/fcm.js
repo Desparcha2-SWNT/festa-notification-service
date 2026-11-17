@@ -2,11 +2,15 @@ import fs from 'node:fs';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
 
+// Solo estos códigos significan que el token ya no sirve: el dispositivo se da de baja.
 const INVALID_TOKEN_CODES = new Set([
   'messaging/registration-token-not-registered',
   'messaging/invalid-registration-token',
-  'messaging/invalid-argument',
 ]);
+
+// Error del payload o de la petición, no del token: FCM lo marca como INVALID_ARGUMENT. Es permanente,
+// pero no implica un token vencido, así que no se borra ningún dispositivo y tampoco se reintenta.
+const PERMANENT_CODES = new Set(['messaging/invalid-argument']);
 
 let messagingPromise;
 
@@ -39,15 +43,18 @@ async function getMessaging() {
  * Envía un push a un conjunto de tokens. Devuelve cuántos fallaron y qué tokens ya no sirven
  * (para borrarlos). Sin FCM configurado no envía nada y no cuenta fallos.
  */
+/**
+ * Resultado por token: `okTokens` ya recibieron el push; `retryableTokens` fallaron de forma reintentable;
+ * `invalidTokens` deben darse de baja; `permanentTokens` fallaron por el payload y no se reintentan.
+ */
 export async function sendPush(tokens, { title, body, data = {} }) {
-  if (tokens.length === 0) return { sent: 0, failed: 0, invalidTokens: [] };
+  const empty = { sent: 0, failed: 0, invalidTokens: [], permanentTokens: [], okTokens: [], retryableTokens: [] };
+  if (tokens.length === 0) return empty;
   const messaging = await getMessaging();
-  if (!messaging) return { sent: 0, failed: 0, invalidTokens: [], disabled: true };
+  if (!messaging) return { ...empty, disabled: true };
 
   const stringData = Object.fromEntries(Object.entries(data).filter(([, v]) => v != null).map(([k, v]) => [k, String(v)]));
-  let sent = 0;
-  let failed = 0;
-  const invalidTokens = [];
+  const result = { ...empty, invalidTokens: [], permanentTokens: [], okTokens: [], retryableTokens: [] };
   // FCM acepta hasta 500 tokens por llamada.
   for (let i = 0; i < tokens.length; i += 500) {
     const batch = tokens.slice(i, i + 500);
@@ -57,13 +64,18 @@ export async function sendPush(tokens, { title, body, data = {} }) {
       data: stringData,
       android: { priority: 'high' },
     });
-    sent += res.successCount;
-    failed += res.failureCount;
+    result.sent += res.successCount;
+    result.failed += res.failureCount;
     res.responses.forEach((r, idx) => {
-      if (!r.success && INVALID_TOKEN_CODES.has(r.error?.code)) invalidTokens.push(batch[idx]);
+      const token = batch[idx];
+      if (r.success) return result.okTokens.push(token);
+      const code = r.error?.code;
+      if (INVALID_TOKEN_CODES.has(code)) result.invalidTokens.push(token);
+      else if (PERMANENT_CODES.has(code)) result.permanentTokens.push(token);
+      else result.retryableTokens.push(token);
     });
   }
-  return { sent, failed, invalidTokens };
+  return result;
 }
 
 export function _resetForTests() {

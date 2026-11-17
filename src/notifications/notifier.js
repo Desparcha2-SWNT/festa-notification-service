@@ -64,12 +64,25 @@ export async function notifyUsers(userIds, message, { dedupeKey, causationId = n
   }
 
   let failedCount = 0;
-  // Fallos que vale la pena reintentar. Un token inválido o dado de baja es permanente: se borra del
-  // usuario y no debe dejar el push pendiente para siempre (ni bloquear el recordatorio).
+  // Fallos que vale la pena reintentar: solo los tokens que FCM rechazó de forma transitoria. Un token
+  // inválido se da de baja y un error de payload no se reintenta; ninguno deja el push pendiente.
   let retryableFailed = 0;
   if (pushUsers.length > 0) {
     const docs = await users.find({ _id: { $in: pushUsers } }, { projection: { devices: 1 } }).toArray();
-    const tokens = docs.flatMap((u) => (u.devices ?? []).map((d) => d.token));
+    const devicesOf = new Map(docs.map((u) => [u._id, (u.devices ?? []).map((d) => d.token)]));
+    // Tokens que ya recibieron este push en un intento anterior: no se les vuelve a enviar (sin duplicados).
+    const prev = await inbox.find({ _id: { $in: pushIds } }, { projection: { pushedTokens: 1 } }).toArray();
+    const deliveredOf = new Map(prev.map((p) => [p._id, new Set(p.pushedTokens ?? [])]));
+    const ownerOf = new Map(); // token -> índice del usuario en pushUsers (y de su fila de bandeja)
+    const tokens = [];
+    pushUsers.forEach((userId, i) => {
+      for (const token of devicesOf.get(userId) ?? []) {
+        if (deliveredOf.get(pushIds[i])?.has(token) || ownerOf.has(token)) continue;
+        ownerOf.set(token, i);
+        tokens.push(token);
+      }
+    });
+    const pendingOf = pushUsers.map(() => 0); // tokens reintentables pendientes por usuario
     try {
       if (tokens.length > 0) {
         const result = await sendPush(tokens, {
@@ -78,13 +91,25 @@ export async function notifyUsers(userIds, message, { dedupeKey, causationId = n
           data: { kind: message.kind, eventId: message.eventId, ...(message.data ?? {}) },
         });
         failedCount = result.failed;
-        retryableFailed = Math.max(result.failed - result.invalidTokens.length, 0);
         if (result.invalidTokens.length > 0) {
           await users.updateMany({}, { $pull: { devices: { token: { $in: result.invalidTokens } } } });
         }
+        // Lo entregado se registra por bandeja: si después falla otro token, el reintento no lo vuelve a mandar.
+        const okOf = pushUsers.map(() => []);
+        for (const token of result.okTokens) okOf[ownerOf.get(token)].push(token);
+        await Promise.all(
+          pushIds.map((id, i) =>
+            okOf[i].length > 0
+              ? inbox.updateMany({ _id: { $in: [id] } }, { $addToSet: { pushedTokens: { $each: okOf[i] } } })
+              : null,
+          ),
+        );
+        for (const token of result.retryableTokens) pendingOf[ownerOf.get(token)] += 1;
+        retryableFailed = result.retryableTokens.length;
       }
-      // Solo se marca como enviado si no quedan fallos reintentables; si no, el reintento lo vuelve a intentar.
-      if (retryableFailed === 0) await inbox.updateMany({ _id: { $in: pushIds } }, { $set: { pushedAt: new Date() } });
+      // pushedAt solo en las bandejas sin tokens reintentables pendientes; el resto lo reintenta el siguiente intento.
+      const doneIds = pushIds.filter((_, i) => pendingOf[i] === 0);
+      if (doneIds.length > 0) await inbox.updateMany({ _id: { $in: doneIds } }, { $set: { pushedAt: new Date() } });
     } catch (err) {
       logger.error({ err, kind: message.kind }, 'falló el envío a FCM');
       failedCount = Math.max(tokens.length, 1);
