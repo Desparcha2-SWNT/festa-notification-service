@@ -88,3 +88,28 @@ describe('sendDueReminders (lease)', () => {
     expect(claimCall[0].$or).toEqual([{ claimedUntil: null }, { claimedUntil: { $lte: now } }]);
   });
 });
+
+describe('startReminderJob', () => {
+  it('arranca a los 5 s, repite cada intervalo aunque falle la tanda y se detiene con stop()', async () => {
+    vi.useFakeTimers();
+    const { logger } = await import('../src/logger.js');
+    const err = vi.spyOn(logger, 'error').mockImplementation(() => {});
+    try {
+      const { startReminderJob } = await import('../src/jobs/reminders.js');
+      // getDb() simulado devuelve {} sin collection(): cada tanda falla y el job debe seguir vivo.
+      const job = startReminderJob({ intervalMs: 1000 });
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(err).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(err).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(err).toHaveBeenCalledTimes(2);
+      job.stop();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(err).toHaveBeenCalledTimes(2);
+    } finally {
+      err.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+});
