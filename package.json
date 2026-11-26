@@ -12,7 +12,7 @@
     "dev": "node --watch src/server.js",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:ci": "vitest run --reporter=junit --outputFile=test-results/junit.xml"
+    "test:ci": "vitest run --coverage --reporter=default --reporter=junit --outputFile.junit=test-results/junit.xml"
   },
   "repository": {
     "type": "git",
