@@ -1,0 +1,152 @@
+import { getDb } from '../db/mongo.js';
+import { logger } from '../logger.js';
+import { enqueue, deterministicUuid } from '../messaging/outboxRepository.js';
+import { sendPush } from '../push/fcm.js';
+
+export const PUSH_KINDS = ['nearby_event', 'reminder', 'event_cancelled', 'event_rescheduled', 'ticket', 'merchant_status', 'report', 'admin', 'other'];
+
+/**
+ * Notifica a varios usuarios: guarda una notificación en la bandeja de cada uno y envía push a sus
+ * dispositivos. Es idempotente por `dedupeKey`: el _id de cada notificación se deriva de
+ * (dedupeKey, userId), así que si el mensaje que la causó se reprocesa, solo se envía push a quien
+ * aún no la tenía. Publica `push.sent` con el alcance (una vez por dedupeKey).
+ *
+ * @param {string[]} userIds
+ * @param {{kind: string, title: string, body: string, eventId?: string, data?: object}} message
+ * @param {{dedupeKey: string, causationId?: string, correlationId?: string}} options
+ */
+export async function notifyUsers(userIds, message, { dedupeKey, causationId = null, correlationId = null }, db = getDb()) {
+  const unique = [...new Set(userIds.filter(Boolean))];
+  const users = db.collection('users');
+  const inbox = db.collection('notifications');
+  const now = new Date();
+
+  // Usuarios suspendidos (moderación) no reciben nada.
+  const blocked = new Set(
+    (await users.find({ _id: { $in: unique }, suspended: true }, { projection: { _id: 1 } }).toArray()).map((u) => u._id),
+  );
+
+  const fresh = [];
+  const pushUsers = []; // usuarios a los que hay que enviar push en este intento
+  const pushIds = []; // ids de bandeja de esos usuarios (para marcar pushedAt)
+  for (const userId of unique) {
+    if (blocked.has(userId)) continue;
+    const id = deterministicUuid(`${dedupeKey}:${userId}`);
+    const res = await inbox.updateOne(
+      { _id: id },
+      {
+        $setOnInsert: {
+          userId,
+          kind: message.kind,
+          title: message.title,
+          body: message.body,
+          eventId: message.eventId ?? null,
+          data: message.data ?? {},
+          createdAt: now,
+          readAt: null,
+        },
+      },
+      { upsert: true },
+    );
+    if (res.upsertedCount === 1) {
+      fresh.push(userId);
+      pushUsers.push(userId);
+      pushIds.push(id);
+    } else {
+      // Ya estaba en la bandeja (intento anterior). El push falta si nunca se confirmó (pushedAt vacío):
+      // así un fallo entre guardar y enviar no deja al usuario sin el aviso.
+      const prev = await inbox.findOne({ _id: id }, { projection: { pushedAt: 1 } });
+      if (prev && !prev.pushedAt) {
+        pushUsers.push(userId);
+        pushIds.push(id);
+      }
+    }
+  }
+
+  let failedCount = 0;
+  // Fallos que vale la pena reintentar: solo los tokens que FCM rechazó de forma transitoria. Un token
+  // inválido se da de baja y un error de payload no se reintenta; ninguno deja el push pendiente.
+  let retryableFailed = 0;
+  if (pushUsers.length > 0) {
+    const docs = await users.find({ _id: { $in: pushUsers } }, { projection: { devices: 1 } }).toArray();
+    const devicesOf = new Map(docs.map((u) => [u._id, (u.devices ?? []).map((d) => d.token)]));
+    // Tokens que ya recibieron este push en un intento anterior: no se les vuelve a enviar (sin duplicados).
+    const prev = await inbox.find({ _id: { $in: pushIds } }, { projection: { pushedTokens: 1 } }).toArray();
+    const deliveredOf = new Map(prev.map((p) => [p._id, new Set(p.pushedTokens ?? [])]));
+    const ownerOf = new Map(); // token -> índice del usuario en pushUsers (y de su fila de bandeja)
+    const tokens = [];
+    pushUsers.forEach((userId, i) => {
+      for (const token of devicesOf.get(userId) ?? []) {
+        if (deliveredOf.get(pushIds[i])?.has(token) || ownerOf.has(token)) continue;
+        ownerOf.set(token, i);
+        tokens.push(token);
+      }
+    });
+    const pendingOf = pushUsers.map(() => 0); // tokens reintentables pendientes por usuario
+    try {
+      if (tokens.length > 0) {
+        const result = await sendPush(tokens, {
+          title: message.title,
+          body: message.body,
+          data: { kind: message.kind, eventId: message.eventId, ...(message.data ?? {}) },
+        });
+        failedCount = result.failed;
+        if (result.invalidTokens.length > 0) {
+          await users.updateMany({}, { $pull: { devices: { token: { $in: result.invalidTokens } } } });
+        }
+        // Lo entregado se registra por bandeja: si después falla otro token, el reintento no lo vuelve a mandar.
+        const okOf = pushUsers.map(() => []);
+        for (const token of result.okTokens) okOf[ownerOf.get(token)].push(token);
+        await Promise.all(
+          pushIds.map((id, i) =>
+            okOf[i].length > 0
+              ? inbox.updateMany({ _id: { $in: [id] } }, { $addToSet: { pushedTokens: { $each: okOf[i] } } })
+              : null,
+          ),
+        );
+        for (const token of result.retryableTokens) pendingOf[ownerOf.get(token)] += 1;
+        retryableFailed = result.retryableTokens.length;
+      }
+      // pushedAt solo en las bandejas sin tokens reintentables pendientes; el resto lo reintenta el siguiente intento.
+      const doneIds = pushIds.filter((_, i) => pendingOf[i] === 0);
+      if (doneIds.length > 0) await inbox.updateMany({ _id: { $in: doneIds } }, { $set: { pushedAt: new Date() } });
+    } catch (err) {
+      logger.error({ err, kind: message.kind }, 'falló el envío a FCM');
+      failedCount = Math.max(tokens.length, 1);
+      retryableFailed = failedCount;
+    }
+  }
+
+  if (fresh.length > 0 || unique.length === 0) {
+    await enqueue(
+      {
+        exchange: 'festa.notification',
+        routingKey: 'push.sent',
+        payload: {
+          kind: PUSH_KINDS.includes(message.kind) ? message.kind : 'other',
+          ...(message.eventId ? { eventId: message.eventId } : {}),
+          recipientCount: fresh.length,
+          failedCount,
+          sentAt: now.toISOString(),
+        },
+        causationId,
+        correlationId,
+        key: dedupeKey,
+      },
+      db,
+    );
+  }
+  return { recipients: fresh.length, failedCount, retryableFailed };
+}
+
+/** Ids de los administradores (para avisos de comercios por verificar y reportes). */
+export async function adminIds(db = getDb()) {
+  const admins = await db.collection('users').find({ role: 'admin' }, { projection: { _id: 1 } }).toArray();
+  return admins.map((a) => a._id);
+}
+
+const money = new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 });
+export const formatCop = (cents) => money.format(cents / 100);
+
+const dateFmt = new Intl.DateTimeFormat('es-CO', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'America/Bogota' });
+export const formatDate = (iso) => dateFmt.format(new Date(iso));
