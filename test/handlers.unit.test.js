@@ -29,6 +29,7 @@ function fakeDb({ attendees = [], reminders = [], event = null, nearby = [] } = 
       return {};
     }),
     findOne: vi.fn(async () => event),
+    aggregate: vi.fn(() => ({ toArray: async () => [] })),
     find: vi.fn((filter) => {
       calls.push([name, 'find', filter]);
       const rows = name === 'attendees' ? attendees : name === 'reminders' ? reminders : nearby;
@@ -162,7 +163,7 @@ describe('handlers', () => {
     await handlers['event.cancelled']({ eventId: 'ev1', title: 'Concierto', reason: 'lluvia' }, env, db);
     const rem = calls.find((c) => c[0] === 'reminders');
     expect(rem[2]).toEqual({ eventId: 'ev1' });
-    expect(rem[3]).toEqual({ $set: { cancelled: true } });
+    expect(rem[3]).toEqual({ $set: { cancelled: true, cancelledBy: 'event' } });
     expect(lastMessage()[0]).toEqual(['u1']);
     expect(lastMessage()[1]).toMatchObject({ kind: 'event_cancelled', body: 'lluvia' });
   });
