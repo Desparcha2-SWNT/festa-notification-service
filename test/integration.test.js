@@ -121,6 +121,72 @@ describe.skipIf(!MONGO)('notification-service con MongoDB', () => {
     expect(await db.collection('notifications').countDocuments({ userId: USER })).toBe(0);
   });
 
+  // ---- Auditoría de seguridad (2026-11-28) ----
+
+  const nearbyUser = async () => {
+    await handlers['location_consent.granted']({ userId: USER, policyVersion: 'v1', grantedAt: new Date().toISOString() }, env('location_consent.granted'), db);
+    await handlers['profile.updated']({ userId: USER, displayName: 'X', interests: ['musical'], updatedAt: new Date().toISOString() }, env('profile.updated'), db);
+    await db.collection('users').updateOne({ _id: USER }, { $set: { location: { type: 'Point', coordinates: [ECI.lng, ECI.lat] }, locationUpdatedAt: new Date(), devices: [{ token: 'tok' }] } });
+  };
+  const publishedNear = (eventId, title = 'Jazz en la ECI') => ({
+    eventId, organizerId: ORGANIZER, title, category: 'musical', isLive: false, status: 'published',
+    startsAt: new Date(Date.now() + 3600_000).toISOString(), endsAt: new Date(Date.now() + 7200_000).toISOString(),
+    venue: { name: 'Bloque G', address: 'ECI', location: { lat: ECI.lat + 0.001, lng: ECI.lng } },
+  });
+
+  it('el push de cercanía no lleva el enlace que puso el organizador', async () => {
+    await nearbyUser();
+    await handlers['event.published'](publishedNear(EVENT_ID, 'Reclama tu boleta en https://evil.co/x'), env('event.published'), db);
+    const saved = await db.collection('notifications').findOne({ kind: 'nearby_event', userId: USER });
+    expect(saved.title).not.toMatch(/https?:|evil\.co/);
+    expect(push.sendPush).toHaveBeenCalledWith(['tok'], expect.objectContaining({ title: expect.not.stringMatching(/evil\.co/) }));
+  });
+
+  it('un usuario recibe como máximo el tope diario de push de cercanía; repetir el mismo evento no cuenta', async () => {
+    await nearbyUser();
+    const { config } = await import('../src/config.js');
+    const ids = ['a', 'b', 'c', 'd', 'e'].map((x) => `7f1c2b8e-3a1d-4c3e-9b0a-1f2e3d4c5b6${x}`);
+    for (const id of ids) await handlers['event.published'](publishedNear(id), env('event.published'), db);
+    expect(await db.collection('notifications').countDocuments({ kind: 'nearby_event', userId: USER })).toBe(config.nearbyMaxPerUserPerDay);
+
+    // Reintento del primer evento (mismo sobre): sigue siendo uno solo y no lo bloquea el tope.
+    const e = env('event.published');
+    await handlers['event.published'](publishedNear(ids[0]), e, db);
+    await handlers['event.published'](publishedNear(ids[0]), e, db);
+    expect(await db.collection('notifications').countDocuments({ kind: 'nearby_event', userId: USER })).toBe(config.nearbyMaxPerUserPerDay);
+  });
+
+  const confirmFor = async (attendanceId) => {
+    await handlers['event.published']({ ...publishedNear(EVENT_ID), category: 'cultural' }, env('event.published'), db);
+    await handlers['attendance.confirmed'](
+      { attendanceId, eventId: EVENT_ID, eventTitle: 'Jazz', eventStartsAt: new Date(Date.now() + 3600_000).toISOString(), userId: USER, source: 'rsvp', passIds: ['p1'], attendeeCount: 1, confirmedAt: new Date().toISOString() },
+      env('attendance.confirmed'),
+      db,
+    );
+  };
+  const reminders = () => db.collection('notifications').countDocuments({ userId: USER, kind: 'reminder' });
+
+  it('RF14: ocultar el evento cancela sus recordatorios y restaurarlo los devuelve', async () => {
+    await confirmFor('a-hidden');
+    await handlers['moderation.event_hidden']({ eventId: EVENT_ID, reason: 'fraude', decidedBy: ADMIN, decidedAt: new Date().toISOString() }, env('moderation.event_hidden'), db);
+    expect(await sendDueReminders(db)).toBe(0);
+    expect(await reminders()).toBe(0);
+
+    await handlers['moderation.event_restored']({ eventId: EVENT_ID, decidedBy: ADMIN, decidedAt: new Date().toISOString() }, env('moderation.event_restored'), db);
+    expect(await sendDueReminders(db)).toBe(1);
+  });
+
+  it('RF14: suspender al organizador pausa los recordatorios de sus eventos; un evento cancelado no vuelve al reactivarlo', async () => {
+    await confirmFor('a-susp');
+    await handlers['moderation.user_suspended']({ userId: ORGANIZER, reason: 'fraude', decidedBy: ADMIN, decidedAt: new Date().toISOString() }, env('moderation.user_suspended'), db);
+    expect(await sendDueReminders(db)).toBe(0);
+
+    await handlers['event.cancelled']({ eventId: EVENT_ID, organizerId: ORGANIZER, title: 'Jazz', reason: 'Lluvia', cancelledAt: new Date().toISOString(), version: 2 }, env('event.cancelled'), db);
+    await handlers['moderation.user_reinstated']({ userId: ORGANIZER, decidedBy: ADMIN, decidedAt: new Date().toISOString() }, env('moderation.user_reinstated'), db);
+    expect(await sendDueReminders(db)).toBe(0);
+    expect(await reminders()).toBe(0);
+  });
+
   describe('API', () => {
     const token = jwt.sign({ role: 'user' }, jwtPrivateKeyPem, { algorithm: 'RS256', issuer: process.env.JWT_ISSUER, subject: USER, expiresIn: '5m' });
     const auth = (r) => r.set('Authorization', `Bearer ${token}`);
