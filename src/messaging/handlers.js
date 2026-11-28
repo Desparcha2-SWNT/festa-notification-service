@@ -3,6 +3,46 @@ import { adminIds, formatCop, formatDate, notifyUsers } from '../notifications/n
 
 const EARTH_RADIUS_M = 6_378_100;
 
+// Enlaces y dominios: el título, el lugar y el motivo de cancelación los escribe el organizador, y un
+// push con la marca Festa no debe llevar un enlace suyo (phishing: «reclama tu boleta en …»).
+const LINK = /\b(?:https?:\/\/|www\.)\S+|\b[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)*\.(?:xn--[a-z0-9-]+|[a-z]{2,})(?:\/\S*)?/giu;
+// Controles y formatos invisibles (saltos de línea, RLO, ANSI).
+const CONTROL = /[\p{Cc}\p{Cf}]/gu;
+
+/** Texto plano y corto para un push: sin enlaces, sin caracteres de control y con un tope de largo. */
+export function plain(text, max = 80) {
+  const clean = String(text ?? '')
+    .replace(CONTROL, ' ')
+    .replace(LINK, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return clean.length > max ? `${clean.slice(0, max - 1).trimEnd()}…` : clean;
+}
+
+/** De `userIds`, los que aún no llegan al tope diario de push de cercanía (sin contar este mismo evento). */
+async function underNearbyCap(db, userIds, eventId) {
+  if (userIds.length === 0) return [];
+  const since = new Date(Date.now() - 24 * 3600_000);
+  const counts = await db
+    .collection('notifications')
+    .aggregate([
+      { $match: { userId: { $in: userIds }, kind: 'nearby_event', createdAt: { $gte: since }, eventId: { $ne: eventId } } },
+      { $group: { _id: '$userId', n: { $sum: 1 } } },
+    ])
+    .toArray();
+  const full = new Set(counts.filter((c) => c.n >= config.nearbyMaxPerUserPerDay).map((c) => c._id));
+  return userIds.filter((id) => !full.has(id));
+}
+
+/** Cancela (o reactiva) los recordatorios de unos eventos por una decisión de moderación. */
+const pauseReminders = (db, filter, by) =>
+  db.collection('reminders').updateMany({ ...filter, cancelled: false }, { $set: { cancelled: true, cancelledBy: by } });
+const resumeReminders = (db, filter, by) =>
+  db.collection('reminders').updateMany({ ...filter, cancelledBy: by }, { $set: { cancelled: false }, $unset: { cancelledBy: '' } });
+async function eventIdsOf(db, organizerId) {
+  return (await db.collection('events').find({ organizerId }, { projection: { _id: 1 } }).toArray()).map((ev) => ev._id);
+}
+
 // Un handler por tipo de mensaje consumido (contracts/README.md § Qué consume cada servicio).
 // Firma: (data, envelope, db). Todos son idempotentes: se pueden repetir sin efectos dobles.
 
@@ -53,8 +93,20 @@ export const handlers = {
       { upsert: true },
     ),
 
-  'moderation.user_suspended': (d, e, db) => upsertUser(db, d.userId, { suspended: true }),
-  'moderation.user_reinstated': (d, e, db) => upsertUser(db, d.userId, { suspended: false }),
+  // Suspender al organizador oculta sus eventos (event-service): sus asistentes dejan de recibir
+  // recordatorios hasta que lo reactiven.
+  'moderation.user_suspended': async (d, e, db) => {
+    await upsertUser(db, d.userId, { suspended: true });
+    await pauseReminders(db, { eventId: { $in: await eventIdsOf(db, d.userId) } }, 'organizer_suspended');
+  },
+  'moderation.user_reinstated': async (d, e, db) => {
+    await upsertUser(db, d.userId, { suspended: false });
+    await resumeReminders(db, { eventId: { $in: await eventIdsOf(db, d.userId) } }, 'organizer_suspended');
+  },
+
+  // RF14: un evento oculto por moderación no sigue mandando recordatorios; al restaurarlo vuelven.
+  'moderation.event_hidden': (d, e, db) => pauseReminders(db, { eventId: d.eventId }, 'moderation'),
+  'moderation.event_restored': (d, e, db) => resumeReminders(db, { eventId: d.eventId }, 'moderation'),
 
   // ---------------------------------------------------------------- comercios (RF3)
   'merchant.submitted': async (d, e, db) =>
@@ -134,14 +186,15 @@ export const handlers = {
       .toArray();
 
     await notifyUsers(
-      nearby.map((u) => u._id),
+      await underNearbyCap(db, nearby.map((u) => u._id), d.eventId),
       {
         kind: 'nearby_event',
-        title: d.isLive ? `🔥 Parche en vivo cerca: ${d.title}` : `Nuevo plan cerca de ti: ${d.title}`,
-        body: `${d.venue.name} · ${formatDate(d.startsAt)}`,
+        title: d.isLive ? `🔥 Parche en vivo cerca: ${plain(d.title)}` : `Nuevo plan cerca de ti: ${plain(d.title)}`,
+        body: `${plain(d.venue.name, 60)} · ${formatDate(d.startsAt)}`,
         eventId: d.eventId,
       },
-      opts(e),
+      // Un aviso por evento y usuario: el mismo evento republicado (otro sobre) no vuelve a avisar.
+      { ...opts(e), dedupeKey: `nearby:${d.eventId}` },
       db,
     );
   },
@@ -155,7 +208,7 @@ export const handlers = {
     }
     await notifyUsers(
       attendees,
-      { kind: 'event_rescheduled', title: `Cambio en ${d.title}`, body: `Ahora es el ${formatDate(d.startsAt)} en ${d.venue.name}.`, eventId: d.eventId },
+      { kind: 'event_rescheduled', title: `Cambio en ${plain(d.title)}`, body: `Ahora es el ${formatDate(d.startsAt)} en ${plain(d.venue.name, 60)}.`, eventId: d.eventId },
       opts(e),
       db,
     );
@@ -163,10 +216,11 @@ export const handlers = {
 
   'event.cancelled': async (d, e, db) => {
     const attendees = await attendeesOf(db, d.eventId);
-    await db.collection('reminders').updateMany({ eventId: d.eventId }, { $set: { cancelled: true } });
+    // cancelledBy: 'event' para que restaurar una decisión de moderación no reactive un evento cancelado.
+    await db.collection('reminders').updateMany({ eventId: d.eventId }, { $set: { cancelled: true, cancelledBy: 'event' } });
     await notifyUsers(
       attendees,
-      { kind: 'event_cancelled', title: `Se canceló ${d.title}`, body: d.reason, eventId: d.eventId },
+      { kind: 'event_cancelled', title: `Se canceló ${plain(d.title)}`, body: plain(d.reason, 160), eventId: d.eventId },
       opts(e),
       db,
     );
@@ -200,7 +254,7 @@ export const handlers = {
 
   'attendance.cancelled': async (d, e, db) => {
     await db.collection('attendees').deleteOne({ _id: d.attendanceId });
-    await db.collection('reminders').updateOne({ _id: d.attendanceId }, { $set: { cancelled: true } });
+    await db.collection('reminders').updateOne({ _id: d.attendanceId }, { $set: { cancelled: true, cancelledBy: 'attendance' } });
   },
 
   'pass.checked_in': async (d, e, db) => {

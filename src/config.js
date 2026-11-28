@@ -32,6 +32,8 @@ export const config = {
   nearbyRadiusMeters: Number(process.env.NEARBY_RADIUS_METERS ?? 3000),
   locationMaxAgeHours: Number(process.env.LOCATION_MAX_AGE_HOURS ?? 72),
   nearbyMaxRecipients: Number(process.env.NEARBY_MAX_RECIPIENTS ?? 500),
+  // Tope de push de cercanía que recibe un usuario en 24 h (todos los organizadores juntos).
+  nearbyMaxPerUserPerDay: Number(process.env.NEARBY_MAX_PER_USER_PER_DAY ?? 3),
   // RF12: recordatorio de asistencia, cuántas horas antes del evento.
   reminderHoursBefore: Number(process.env.REMINDER_HOURS_BEFORE ?? 2),
 };
